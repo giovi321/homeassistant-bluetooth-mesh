@@ -103,12 +103,12 @@ class Light(Generic):
             self.notify(Light.BrightnessProperty, result["present_lightness"])
 
     async def set_ctl_unack(self, temperature=None, brightness=None, **kwargs):
-        if temperature:
+        if temperature is not None:
             self.notify(Light.TemperatureProperty, temperature)
         else:
             temperature = self.retained(Light.TemperatureProperty, 255)
-        if brightness:
-            self.notify(Light.BrightnessProperty, temperature)
+        if brightness is not None:
+            self.notify(Light.BrightnessProperty, brightness)
         else:
             brightness = self.retained(Light.BrightnessProperty, 100)
 
