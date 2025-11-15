@@ -41,7 +41,23 @@ class Generic(Node):
         client = self._app.elements[0][models.ConfigClient]
         data = await client.get_composition_data([self.unicast], net_index=0, timeout=30)
         # TODO: multi page composition data support
-        page_zero = data.get(self.unicast, {}).get("zero")
+        if not data:
+            logging.warning("No composition data returned for %s", self)
+            self._composition = None
+            return
+
+        node_data = data.get(self.unicast)
+        if not node_data:
+            logging.warning("Missing composition data for %s (payload: %s)", self, data)
+            self._composition = None
+            return
+
+        page_zero = node_data.get("zero")
+        if page_zero is None:
+            logging.warning("Composition data for %s has no page zero (payload: %s)", self, node_data)
+            self._composition = None
+            return
+
         self._composition = Composition(page_zero)
 
     async def bind(self, app):
