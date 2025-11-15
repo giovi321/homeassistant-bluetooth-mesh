@@ -61,10 +61,24 @@ class GenericLightBridge(HassMqttBridge):
         await self._messenger.publish(self.component, node, "state", message, retain=True)
 
     async def _mqtt_set(self, node, payload):
-        if "color_temp" in payload:
-            await node.set_mireds(payload["color_temp"])
-        if "brightness" in payload:
-            await node.set_brightness(payload["brightness"])
+        color_temp = payload.get("color_temp")
+        brightness = payload.get("brightness")
+
+        # Home Assistant sends color temperature and brightness together when the
+        # user adjusts the color temperature slider. Dispatch both properties in
+        # a single CTL message to avoid flooding the mesh with multiple
+        # back-to-back commands.
+        if node.supports(Light.TemperatureProperty) and (color_temp is not None or brightness is not None):
+            temperature = None
+            if color_temp is not None:
+                temperature = 1000000 // color_temp
+            await node.set_ctl_unack(temperature=temperature, brightness=brightness)
+        else:
+            if color_temp is not None:
+                await node.set_mireds(color_temp)
+            if brightness is not None:
+                await node.set_brightness(brightness)
+
         if payload.get("state") == "ON":
             await node.turn_on()
         if payload.get("state") == "OFF":
