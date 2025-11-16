@@ -68,6 +68,9 @@ class MqttGateway(Application):
     CRPL = 32768
     PATH = "/org/hass/mesh"
 
+    DEFAULT_NETWORK_TRANSMIT_COUNT = 0
+    DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS = 1
+
     def __init__(self, loop, basedir):
         super().__init__(loop)
 
@@ -206,6 +209,8 @@ class MqttGateway(Application):
                 self._nodes.persist()
                 return
 
+            await self._configure_network_transmit()
+
             try:
                 # set overall application key
                 await self.add_app_key(*self.app_keys[0])
@@ -238,6 +243,78 @@ class MqttGateway(Application):
 
             # wait for all tasks
             await tasks.gather()
+
+    async def _configure_network_transmit(self):
+        """Clamp and apply the network transmit configuration so we do not flood the mesh."""
+
+        mgmt = getattr(self, "management_interface", None)
+        if mgmt is None:
+            logging.warning("Mesh management interface unavailable; cannot configure network transmit")
+            return
+
+        set_transmit = getattr(mgmt, "set_transmit", None)
+        if set_transmit is None:
+            logging.warning("Mesh management interface exposes no set_transmit method; skipping transmit tuning")
+            return
+
+        count = self._config.optional(
+            "network_transmit.count",
+            self.DEFAULT_NETWORK_TRANSMIT_COUNT,
+        )
+        interval_steps = self._config.optional(
+            "network_transmit.interval_steps",
+            self.DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS,
+        )
+
+        try:
+            count = int(count)
+            interval_steps = int(interval_steps)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Invalid network_transmit configuration (%s, %s); falling back to defaults",
+                count,
+                interval_steps,
+            )
+            count = self.DEFAULT_NETWORK_TRANSMIT_COUNT
+            interval_steps = self.DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS
+
+        count = max(0, min(7, count))
+        interval_steps = max(0, min(31, interval_steps))
+
+        async def _try_call(signature, *args, **kwargs):
+            try:
+                await set_transmit(*args, **kwargs)
+                return True
+            except TypeError:
+                return None
+            except Exception:
+                logging.exception("Failed to configure network transmit using %s signature", signature)
+                return False
+
+        # Support older python-bluetooth-mesh releases whose signature may not
+        # accept keywords yet.
+        for signature, call_kwargs in (
+            ("positional", {"args": (count, interval_steps)}),
+            ("interval keyword", {"kwargs": {"count": count, "interval": interval_steps}}),
+            ("interval_steps keyword", {"kwargs": {"count": count, "interval_steps": interval_steps}}),
+        ):
+            result = await _try_call(
+                signature,
+                *(call_kwargs.get("args", ())),
+                **call_kwargs.get("kwargs", {}),
+            )
+            if result is True:
+                logging.info(
+                    "Configured network transmit: count=%s (total=%s) interval_steps=%s",
+                    count,
+                    count + 1,
+                    interval_steps,
+                )
+                return
+            if result is False:
+                return
+
+        logging.warning("Failed to call set_transmit; unexpected method signature")
 
     async def _connect_with_recovery(self):
         try:
