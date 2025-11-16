@@ -11,6 +11,7 @@ from bluetooth_mesh.application import Application, Element
 from bluetooth_mesh.crypto import ApplicationKey, DeviceKey, NetworkKey
 from bluetooth_mesh.messages.config import GATTNamespaceDescriptor
 from bluetooth_mesh import models
+from dbus_next.errors import DBusError
 
 from tools import Config, Store, Tasks
 from mesh import Node, NodeManager
@@ -194,7 +195,7 @@ class MqttGateway(Application):
 
             # connect to daemon
             await stack.enter_async_context(self)
-            await self.connect()
+            await self._connect_with_recovery()
 
             # leave network
             if args.leave:
@@ -235,6 +236,35 @@ class MqttGateway(Application):
 
             # wait for all tasks
             await tasks.gather()
+
+    async def _connect_with_recovery(self):
+        try:
+            await self.connect()
+        except DBusError as err:
+            if await self._recover_from_connect_failure(err):
+                return
+            raise
+
+    async def _recover_from_connect_failure(self, err):
+        text = getattr(err, "text", str(err)) or ""
+        name = getattr(err, "_name", "") or ""
+        if "Node already exists" in text or name.endswith("AlreadyExists"):
+            logging.warning("Mesh daemon already knows this node, attempting to delete stale instance before retrying attach")
+            delete_node = getattr(self.management_interface, "delete_node", None)
+            if not delete_node:
+                logging.error("Mesh management interface has no delete_node method; manual cleanup required")
+                return False
+            try:
+                await delete_node(self.address)
+            except Exception:
+                logging.exception("Failed to delete stale application node from mesh daemon")
+                return False
+            logging.info("Deleted stale mesh application node, retrying connect")
+            await asyncio.sleep(1)
+            await self.connect()
+            return True
+        logging.error("Mesh attach/import failed: %s", text)
+        return False
 
 
 def main():
