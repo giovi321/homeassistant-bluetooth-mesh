@@ -50,7 +50,7 @@ mesh:
   ...
 ```
 
-- **It is very important to disable bluetooth on the host system!** This is neccessary, because the bluetooth-mesh service needs exclusive access to the bluetooth device.
+- **It is very important to disable bluetooth on the host system!** This is neccessary, because the bluetooth-mesh service needs exclusive access to the bluetooth device. If `bluetoothd` (or any other process) still owns the adapter you will see `Controller hci X already in use (281)` errors from `bluetooth-meshd` during start-up and the gateway will fail to attach. Stop and disable the host bluetooth service before launching the container.
 
 ```
 sudo systemctl stop bluetooth

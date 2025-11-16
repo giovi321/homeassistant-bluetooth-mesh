@@ -11,7 +11,7 @@ from bluetooth_mesh.application import Application, Element
 from bluetooth_mesh.crypto import ApplicationKey, DeviceKey, NetworkKey
 from bluetooth_mesh.messages.config import GATTNamespaceDescriptor
 from bluetooth_mesh import models
-from dbus_next.errors import DBusError
+from dbus_next.errors import DBusError, InterfaceNotFoundError
 
 from tools import Config, Store, Tasks
 from mesh import Node, NodeManager
@@ -194,7 +194,7 @@ class MqttGateway(Application):
             tasks = await stack.enter_async_context(Tasks())
 
             # connect to daemon
-            await stack.enter_async_context(self)
+            await self._enter_dbus_context(stack)
             await self._connect_with_recovery()
 
             # leave network
@@ -244,6 +244,23 @@ class MqttGateway(Application):
             if await self._recover_from_connect_failure(err):
                 return
             raise
+
+    async def _enter_dbus_context(self, stack):
+        """Ensure the Application enters its dbus context, retrying if mesh service not ready."""
+
+        delay = 1
+        while True:
+            try:
+                await stack.enter_async_context(self)
+                return
+            except InterfaceNotFoundError as err:
+                logging.warning(
+                    "Mesh service missing org.bluez.mesh.Network1 interface; bluetooth-meshd may still be starting."
+                    " Retrying in %ss",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
 
     async def _recover_from_connect_failure(self, err):
         text = getattr(err, "text", str(err)) or ""
