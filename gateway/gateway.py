@@ -11,6 +11,8 @@ from bluetooth_mesh.application import Application, Element
 from bluetooth_mesh.crypto import ApplicationKey, DeviceKey, NetworkKey
 from bluetooth_mesh.messages.config import GATTNamespaceDescriptor
 from bluetooth_mesh import models
+from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType
 from dbus_next.errors import DBusError, InterfaceNotFoundError
 
 from tools import Config, Store, Tasks
@@ -246,21 +248,23 @@ class MqttGateway(Application):
             raise
 
     async def _enter_dbus_context(self, stack):
-        """Ensure the Application enters its dbus context, retrying if mesh service not ready."""
+        """Ensure the Application enters its dbus context once the mesh service is ready."""
+
+        await self._wait_for_mesh_network_interface()
 
         delay = 1
         while True:
             try:
                 await stack.enter_async_context(self)
                 return
-            except InterfaceNotFoundError as err:
+            except InterfaceNotFoundError:
                 logging.warning(
-                    "Mesh service missing org.bluez.mesh.Network1 interface; bluetooth-meshd may still be starting."
-                    " Retrying in %ss",
+                    "Mesh service still missing org.bluez.mesh.Network1 interface; forcing re-introspection in %ss",
                     delay,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
+                await self._wait_for_mesh_network_interface()
 
     async def _recover_from_connect_failure(self, err):
         text = getattr(err, "text", str(err)) or ""
@@ -307,6 +311,31 @@ class MqttGateway(Application):
             "Mesh management interface exposes no delete_node method; manual cleanup required"
         )
         return False
+
+    async def _wait_for_mesh_network_interface(self):
+        """Block until org.bluez.mesh exports Network1 so Application entry will succeed."""
+
+        delay = 1
+        while True:
+            bus = MessageBus(bus_type=BusType.SYSTEM)
+            try:
+                await bus.connect()
+                introspection = await bus.introspect("org.bluez.mesh", "/org/bluez/mesh")
+                if any(interface.name == "org.bluez.mesh.Network1" for interface in introspection.interfaces):
+                    return
+            except Exception:
+                # fall through to retry logging below
+                pass
+            finally:
+                with suppress(Exception):
+                    bus.disconnect()
+
+            logging.warning(
+                "Mesh service missing org.bluez.mesh.Network1 interface; bluetooth-meshd may still be starting. Retrying in %ss",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def main():
