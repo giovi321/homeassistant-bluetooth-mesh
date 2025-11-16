@@ -89,9 +89,23 @@ class Generic(Node):
 
         # configure model
         client = self._app.elements[0][models.ConfigClient]
-        await client.bind_app_key(
-            self.unicast, net_index=0, element_address=self.unicast, app_key_index=self._app.app_keys[0][0], model=model
-        )
+        try:
+            await client.bind_app_key(
+                self.unicast,
+                net_index=0,
+                element_address=self.unicast,
+                app_key_index=self._app.app_keys[0][0],
+                model=model,
+            )
+        except asyncio.CancelledError:
+            logging.warning("Bind for %s on %s was cancelled", model, self)
+            return False
+        except asyncio.TimeoutError:
+            logging.warning("Timed out binding %s on %s", model, self)
+            return False
+        except Exception:
+            logging.exception("Unexpected failure binding %s on %s", model, self)
+            return False
         self._bound_models.add(model)
 
         logging.info(f"{self} bound {model}")
