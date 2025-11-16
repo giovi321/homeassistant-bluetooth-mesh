@@ -249,21 +249,46 @@ class MqttGateway(Application):
         text = getattr(err, "text", str(err)) or ""
         name = getattr(err, "_name", "") or ""
         if "Node already exists" in text or name.endswith("AlreadyExists"):
-            logging.warning("Mesh daemon already knows this node, attempting to delete stale instance before retrying attach")
-            delete_node = getattr(self.management_interface, "delete_node", None)
-            if not delete_node:
-                logging.error("Mesh management interface has no delete_node method; manual cleanup required")
-                return False
-            try:
-                await delete_node(self.address)
-            except Exception:
-                logging.exception("Failed to delete stale application node from mesh daemon")
+            logging.warning(
+                "Mesh daemon already knows this node, attempting to delete stale instance before retrying attach"
+            )
+            if not await self._delete_stale_mesh_node():
                 return False
             logging.info("Deleted stale mesh application node, retrying connect")
             await asyncio.sleep(1)
             await self.connect()
             return True
         logging.error("Mesh attach/import failed: %s", text)
+        return False
+
+    async def _delete_stale_mesh_node(self):
+        """Best-effort removal of the previously registered mesh node."""
+
+        delete_node = getattr(self.management_interface, "delete_node", None)
+        if delete_node:
+            try:
+                await delete_node(self.address)
+                return True
+            except Exception:
+                logging.exception("Failed to delete stale application node from mesh daemon")
+                return False
+
+        # Older versions of python-bluetooth-mesh expose only the raw dbus-next
+        # proxy interface. Attempt to invoke DeleteNode directly before giving
+        # up so operators do not need to clean up state manually.
+        proxy_interface = getattr(self.management_interface, "_interface", None)
+        call_delete_node = getattr(proxy_interface, "call_delete_node", None)
+        if call_delete_node:
+            try:
+                await call_delete_node(self.address)
+                return True
+            except Exception:
+                logging.exception("Failed to delete stale application node via proxy interface")
+                return False
+
+        logging.error(
+            "Mesh management interface exposes no delete_node method; manual cleanup required"
+        )
         return False
 
 
