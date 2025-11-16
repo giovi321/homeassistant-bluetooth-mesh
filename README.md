@@ -48,9 +48,17 @@ mesh:
     type: light             # thats it for now
     [relay: <true|false>]   # whether this node should act as relay
   ...
+
+# Optional: clamp how many times the gateway retransmits every mesh message.
+# count is the number of *extra* transmissions (so 0 == send once).
+network_transmit:
+  count: 0
+  interval_steps: 1
 ```
 
-- **It is very important to disable bluetooth on the host system!** This is neccessary, because the bluetooth-mesh service needs exclusive access to the bluetooth device.
+- **It is very important to disable bluetooth on the host system!** This is neccessary, because the bluetooth-mesh service needs exclusive access to the bluetooth device. If `bluetoothd` (or any other process) still owns the adapter you will see `Controller hci X already in use (281)` errors from `bluetooth-meshd` during start-up and the gateway will fail to attach. Stop and disable the host bluetooth service before launching the container.
+
+- The gateway now forces its local mesh transmit count down to a single send so slider movements in Home Assistant do not swamp the network. If you need additional redundancy you can bump the optional `network_transmit.count` config knob shown above, but every extra count instructs BlueZ to emit another copy of each message.
 
 ```
 sudo systemctl stop bluetooth

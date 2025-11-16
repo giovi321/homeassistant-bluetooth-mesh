@@ -11,6 +11,9 @@ from bluetooth_mesh.application import Application, Element
 from bluetooth_mesh.crypto import ApplicationKey, DeviceKey, NetworkKey
 from bluetooth_mesh.messages.config import GATTNamespaceDescriptor
 from bluetooth_mesh import models
+from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType
+from dbus_next.errors import DBusError, InterfaceNotFoundError
 
 from tools import Config, Store, Tasks
 from mesh import Node, NodeManager
@@ -64,6 +67,9 @@ class MqttGateway(Application):
     }
     CRPL = 32768
     PATH = "/org/hass/mesh"
+
+    DEFAULT_NETWORK_TRANSMIT_COUNT = 0
+    DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS = 1
 
     def __init__(self, loop, basedir):
         super().__init__(loop)
@@ -193,8 +199,8 @@ class MqttGateway(Application):
             tasks = await stack.enter_async_context(Tasks())
 
             # connect to daemon
-            await stack.enter_async_context(self)
-            await self.connect()
+            await self._enter_dbus_context(stack)
+            await self._connect_with_recovery()
 
             # leave network
             if args.leave:
@@ -202,6 +208,8 @@ class MqttGateway(Application):
                 self._nodes.reset()
                 self._nodes.persist()
                 return
+
+            await self._configure_network_transmit()
 
             try:
                 # set overall application key
@@ -235,6 +243,176 @@ class MqttGateway(Application):
 
             # wait for all tasks
             await tasks.gather()
+
+    async def _configure_network_transmit(self):
+        """Clamp and apply the network transmit configuration so we do not flood the mesh."""
+
+        mgmt = getattr(self, "management_interface", None)
+        if mgmt is None:
+            logging.warning("Mesh management interface unavailable; cannot configure network transmit")
+            return
+
+        set_transmit = getattr(mgmt, "set_transmit", None)
+        if set_transmit is None:
+            logging.warning("Mesh management interface exposes no set_transmit method; skipping transmit tuning")
+            return
+
+        count = self._config.optional(
+            "network_transmit.count",
+            self.DEFAULT_NETWORK_TRANSMIT_COUNT,
+        )
+        interval_steps = self._config.optional(
+            "network_transmit.interval_steps",
+            self.DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS,
+        )
+
+        try:
+            count = int(count)
+            interval_steps = int(interval_steps)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Invalid network_transmit configuration (%s, %s); falling back to defaults",
+                count,
+                interval_steps,
+            )
+            count = self.DEFAULT_NETWORK_TRANSMIT_COUNT
+            interval_steps = self.DEFAULT_NETWORK_TRANSMIT_INTERVAL_STEPS
+
+        count = max(0, min(7, count))
+        interval_steps = max(0, min(31, interval_steps))
+
+        async def _try_call(signature, *args, **kwargs):
+            try:
+                await set_transmit(*args, **kwargs)
+                return True
+            except TypeError:
+                return None
+            except Exception:
+                logging.exception("Failed to configure network transmit using %s signature", signature)
+                return False
+
+        # Support older python-bluetooth-mesh releases whose signature may not
+        # accept keywords yet.
+        for signature, call_kwargs in (
+            ("positional", {"args": (count, interval_steps)}),
+            ("interval keyword", {"kwargs": {"count": count, "interval": interval_steps}}),
+            ("interval_steps keyword", {"kwargs": {"count": count, "interval_steps": interval_steps}}),
+        ):
+            result = await _try_call(
+                signature,
+                *(call_kwargs.get("args", ())),
+                **call_kwargs.get("kwargs", {}),
+            )
+            if result is True:
+                logging.info(
+                    "Configured network transmit: count=%s (total=%s) interval_steps=%s",
+                    count,
+                    count + 1,
+                    interval_steps,
+                )
+                return
+            if result is False:
+                return
+
+        logging.warning("Failed to call set_transmit; unexpected method signature")
+
+    async def _connect_with_recovery(self):
+        try:
+            await self.connect()
+        except DBusError as err:
+            if await self._recover_from_connect_failure(err):
+                return
+            raise
+
+    async def _enter_dbus_context(self, stack):
+        """Ensure the Application enters its dbus context once the mesh service is ready."""
+
+        await self._wait_for_mesh_network_interface()
+
+        delay = 1
+        while True:
+            try:
+                await stack.enter_async_context(self)
+                return
+            except InterfaceNotFoundError:
+                logging.warning(
+                    "Mesh service still missing org.bluez.mesh.Network1 interface; forcing re-introspection in %ss",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+                await self._wait_for_mesh_network_interface()
+
+    async def _recover_from_connect_failure(self, err):
+        text = getattr(err, "text", str(err)) or ""
+        name = getattr(err, "_name", "") or ""
+        if "Node already exists" in text or name.endswith("AlreadyExists"):
+            logging.warning(
+                "Mesh daemon already knows this node, attempting to delete stale instance before retrying attach"
+            )
+            if not await self._delete_stale_mesh_node():
+                return False
+            logging.info("Deleted stale mesh application node, retrying connect")
+            await asyncio.sleep(1)
+            await self.connect()
+            return True
+        logging.error("Mesh attach/import failed: %s", text)
+        return False
+
+    async def _delete_stale_mesh_node(self):
+        """Best-effort removal of the previously registered mesh node."""
+
+        delete_node = getattr(self.management_interface, "delete_node", None)
+        if delete_node:
+            try:
+                await delete_node(self.address)
+                return True
+            except Exception:
+                logging.exception("Failed to delete stale application node from mesh daemon")
+                return False
+
+        # Older versions of python-bluetooth-mesh expose only the raw dbus-next
+        # proxy interface. Attempt to invoke DeleteNode directly before giving
+        # up so operators do not need to clean up state manually.
+        proxy_interface = getattr(self.management_interface, "_interface", None)
+        call_delete_node = getattr(proxy_interface, "call_delete_node", None)
+        if call_delete_node:
+            try:
+                await call_delete_node(self.address)
+                return True
+            except Exception:
+                logging.exception("Failed to delete stale application node via proxy interface")
+                return False
+
+        logging.error(
+            "Mesh management interface exposes no delete_node method; manual cleanup required"
+        )
+        return False
+
+    async def _wait_for_mesh_network_interface(self):
+        """Block until org.bluez.mesh exports Network1 so Application entry will succeed."""
+
+        delay = 1
+        while True:
+            bus = MessageBus(bus_type=BusType.SYSTEM)
+            try:
+                await bus.connect()
+                introspection = await bus.introspect("org.bluez.mesh", "/org/bluez/mesh")
+                if any(interface.name == "org.bluez.mesh.Network1" for interface in introspection.interfaces):
+                    return
+            except Exception:
+                # fall through to retry logging below
+                pass
+            finally:
+                with suppress(Exception):
+                    bus.disconnect()
+
+            logging.warning(
+                "Mesh service missing org.bluez.mesh.Network1 interface; bluetooth-meshd may still be starting. Retrying in %ss",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def main():
